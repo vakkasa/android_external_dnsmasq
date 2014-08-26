@@ -683,7 +683,7 @@ int random_sock(int family)
 }
   
 
-int local_bind(int fd, union mysockaddr *addr, char *intname, int is_tcp)
+int local_bind(int fd, union mysockaddr *addr, char *intname, uint32_t mark, int is_tcp)
 {
   union mysockaddr addr_copy = *addr;
 
@@ -707,10 +707,13 @@ int local_bind(int fd, union mysockaddr *addr, char *intname, int is_tcp)
     return 0;
 #endif
 
+  if (mark != 0 && setsockopt(fd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) == -1)
+    return 0;
+
   return 1;
 }
 
-static struct serverfd *allocate_sfd(union mysockaddr *addr, char *intname)
+static struct serverfd *allocate_sfd(union mysockaddr *addr, char *intname, uint32_t mark)
 {
   struct serverfd *sfd;
   int errsave;
@@ -737,6 +740,7 @@ static struct serverfd *allocate_sfd(union mysockaddr *addr, char *intname)
   /* may have a suitable one already */
   for (sfd = daemon->sfds; sfd; sfd = sfd->next )
     if (sockaddr_isequal(&sfd->source_addr, addr) &&
+	mark == sfd->mark &&
 	strcmp(intname, sfd->interface) == 0)
       return sfd;
   
@@ -751,7 +755,7 @@ static struct serverfd *allocate_sfd(union mysockaddr *addr, char *intname)
       return NULL;
     }
   
-  if (!local_bind(sfd->fd, addr, intname, 0) || !fix_fd(sfd->fd))
+  if (!local_bind(sfd->fd, addr, intname, mark, 0) || !fix_fd(sfd->fd))
     { 
       errsave = errno; /* save error from bind. */
       close(sfd->fd);
@@ -762,6 +766,7 @@ static struct serverfd *allocate_sfd(union mysockaddr *addr, char *intname)
     
   strcpy(sfd->interface, intname); 
   sfd->source_addr = *addr;
+  sfd->mark = mark;
   sfd->next = daemon->sfds;
   daemon->sfds = sfd;
   return sfd; 
@@ -783,7 +788,7 @@ void pre_allocate_sfds(void)
 #ifdef HAVE_SOCKADDR_SA_LEN
       addr.in.sin_len = sizeof(struct sockaddr_in);
 #endif
-      allocate_sfd(&addr, "");
+      allocate_sfd(&addr, "", 0);
 #ifdef HAVE_IPV6
       memset(&addr, 0, sizeof(addr));
       addr.in6.sin6_family = AF_INET6;
@@ -792,13 +797,13 @@ void pre_allocate_sfds(void)
 #ifdef HAVE_SOCKADDR_SA_LEN
       addr.in6.sin6_len = sizeof(struct sockaddr_in6);
 #endif
-      allocate_sfd(&addr, "");
+      allocate_sfd(&addr, "", 0);
 #endif
     }
   
   for (srv = daemon->servers; srv; srv = srv->next)
     if (!(srv->flags & (SERV_LITERAL_ADDRESS | SERV_NO_ADDR)) &&
-	!allocate_sfd(&srv->source_addr, srv->interface) &&
+	!allocate_sfd(&srv->source_addr, srv->interface, srv->mark) &&
 	errno != 0 &&
 	(daemon->options & OPT_NOWILD))
       {
@@ -848,7 +853,7 @@ void check_servers(void)
 	  
 	  /* Do we need a socket set? */
 	  if (!new->sfd && 
-	      !(new->sfd = allocate_sfd(&new->source_addr, new->interface)) &&
+	      !(new->sfd = allocate_sfd(&new->source_addr, new->interface, new->mark)) &&
 	      errno != 0)
 	    {
 	      my_syslog(LOG_WARNING, 
@@ -1017,7 +1022,9 @@ void set_interfaces(const char *interfaces)
 }
 
 /*
- * Takes a string in the format "1.2.3.4:1.2.3.4:..." - up to 1024 bytes in length
+ * Takes a string in the format "0x100b:1.2.3.4:1.2.3.4:..." - up to 1024 bytes in length
+ *  - The first element is the socket mark to set on sockets that forward DNS queries.
+ *  - The subsequent elements are the DNS servers to forward queries to.
  */
 int set_servers(const char *servers)
 {
@@ -1025,6 +1032,8 @@ int set_servers(const char *servers)
   struct server *old_servers = NULL;
   struct server *new_servers = NULL;
   struct server *serv;
+  char *mark_string;
+  uint32_t mark;
 
   strncpy(s, servers, sizeof(s));
 
@@ -1049,10 +1058,14 @@ int set_servers(const char *servers)
       serv = tmp;
     }
 
-    char *next = s;
-    char *saddr;
+  char *next = s;
+  char *saddr;
 
- while ((saddr = strsep(&next, ":"))) {
+  /* Parse the mark. */
+  mark_string = strsep(&next, ":");
+  mark = strtoul(mark_string, NULL, 0);
+
+  while ((saddr = strsep(&next, ":"))) {
       union mysockaddr addr, source_addr;
       memset(&addr, 0, sizeof(addr));
       memset(&source_addr, 0, sizeof(source_addr));
@@ -1098,6 +1111,7 @@ int set_servers(const char *servers)
       serv->source_addr = source_addr;
       serv->domain = NULL;
       serv->interface[0] = 0;
+      serv->mark = mark;
       serv->sfd = NULL;
       serv->flags = SERV_FROM_RESOLV;
       serv->queries = serv->failed_queries = 0;
@@ -1211,6 +1225,7 @@ int reload_servers(char *fname)
       serv->source_addr = source_addr;
       serv->domain = NULL;
       serv->interface[0] = 0;
+      serv->mark = 0;
       serv->sfd = NULL;
       serv->flags = SERV_FROM_RESOLV;
       serv->queries = serv->failed_queries = 0;
